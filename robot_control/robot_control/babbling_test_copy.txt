@@ -1,0 +1,329 @@
+#!/usr/bin/env python3
+import rclpy
+from rclpy.node import Node
+from ament_index_python.packages import get_package_share_directory
+import numpy as np
+import os
+import sys
+import time
+
+# === 引入绘图库 ===
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+
+from robot_interfaces.msg import MotorCommand, MotorState
+
+# ==========================================
+# 1. 全局配置与 ID 分组
+# ==========================================
+CONTROL_FREQ = 100.0          
+DT = 1.0 / CONTROL_FREQ       
+POINTS_PER_SEC = 2.0         
+
+# ID 定义
+STS_IDS = [1, 2, 3, 4, 5, 6]      # 6个 STS 电机
+HLS_IDS = [7, 8, 9, 10]           # 4个 HLS 电机
+ALL_IDS = STS_IDS + HLS_IDS       # [1, ..., 10]
+TOTAL_JOINTS = len(ALL_IDS)
+
+# 索引切片 (用于 numpy 数组操作)
+STS_IDX = slice(0, 6)   # 对应数组前6个
+HLS_IDX = slice(6, 10)  # 对应数组后4个
+
+# [可视化配置]
+VIS_UPDATE_INTERVAL = 1      
+RENDER_DOWNSAMPLE = 1        
+
+# ==========================================
+# 2. 物理与控制参数 (严格区分 STS 和 HLS)
+# ==========================================
+
+# --- STS 参数 (ID 1-6) ---
+# 1 mm/s = 1.201 RPM (基于丝杆导程)
+STS_MM_SEC_TO_RPM = 1.201   
+STS_KP = 5.0
+STS_KD = 0.03
+STS_K_FF = 0.5
+STS_MAX_RPM = 100.0
+
+# --- HLS 参数 (ID 7-10) ---
+# 注意：如果 HLS 是轮子，公式是 RPM = (Velocity_mm_s * 60) / (PI * Diameter_mm)
+# 暂时假设其线速度映射与 STS 接近，如果发现 HLS 跑得太快/太慢，请修改这里！
+HLS_MM_SEC_TO_RPM = 1.201   
+HLS_KP = 5.0      # HLS 通常力矩更大，参数可能需要微调
+HLS_KD = 0.03     # 增加阻尼
+HLS_K_FF = 0.5
+HLS_MAX_RPM = 100.0 # HLS 通常转速上限更高
+
+# [绘图边界 - 仅用于 Module 1 (STS) 可视化]
+LIMIT_MIN, LIMIT_MAX = 10.0, 160.0
+CPL_OFFSET, CPL_COEFF, CPL_EXP = 10.0, 0.17, 1.1
+
+def get_dynamic_bounds(q_p):
+    d_min = CPL_OFFSET + CPL_COEFF * np.power(np.maximum(0, q_p - CPL_OFFSET), CPL_EXP)
+    d_max = CPL_OFFSET + np.power(np.maximum(0, q_p - CPL_OFFSET) / CPL_COEFF, 1.0/CPL_EXP)
+    return np.maximum(LIMIT_MIN, d_min), np.minimum(LIMIT_MAX, d_max)
+
+class StatSculptPlayer(Node):
+    def __init__(self):
+        super().__init__('stat_sculpt_player')
+        
+        # 1. 初始化控制向量 (Vectorization)
+        self._init_control_vectors()
+
+        # 2. 加载数据
+        self.traj_data = None 
+        self.total_points = 0
+        if not self._init_data_resource():
+            self.destroy_node()
+            sys.exit(1)
+
+        # 3. 初始化可视化
+        self._init_visualization()
+        
+        # 4. 通信接口
+        self.pub_cmd = self.create_publisher(MotorCommand, 'motor_cmd', 10)
+        self.sub_state = self.create_subscription(MotorState, 'motor_state', self.state_callback, 10)
+        
+        # 5. 运行时状态
+        self.current_pos_map = {} 
+        self.last_feedback_time = 0.0
+        self.loop_counter = 0    
+        
+        # PID 状态 (10维向量)
+        self.prev_err = np.zeros(TOTAL_JOINTS)
+        
+        # 绘图历史 (只存 Mod 1)
+        self.mod1_q1_history = []
+        self.mod1_q2_history = []
+        
+        self.is_ready = False       
+        self.is_homed = False       
+        self.is_finished = False    
+        self.start_time = None      
+        
+        self.timer = self.create_timer(DT, self.control_loop)
+        
+        self.get_logger().info(f"✅ 10-Axis Player Ready.")
+        self.get_logger().info(f"   STS Params (1-6): KP={STS_KP}, Ratio={STS_MM_SEC_TO_RPM}")
+        self.get_logger().info(f"   HLS Params (7-10): KP={HLS_KP}, Ratio={HLS_MM_SEC_TO_RPM}")
+
+    def _init_control_vectors(self):
+        """构建差异化的参数向量，避免在循环中写 if-else"""
+        # 创建全 0 向量
+        self.KP_VEC = np.zeros(TOTAL_JOINTS)
+        self.KD_VEC = np.zeros(TOTAL_JOINTS)
+        self.KFF_VEC = np.zeros(TOTAL_JOINTS)
+        self.RATIO_VEC = np.zeros(TOTAL_JOINTS)
+        self.MAX_RPM_VEC = np.zeros(TOTAL_JOINTS)
+
+        # 填充 STS 参数 (前6个)
+        self.KP_VEC[STS_IDX]      = STS_KP
+        self.KD_VEC[STS_IDX]      = STS_KD
+        self.KFF_VEC[STS_IDX]     = STS_K_FF
+        self.RATIO_VEC[STS_IDX]   = STS_MM_SEC_TO_RPM
+        self.MAX_RPM_VEC[STS_IDX] = STS_MAX_RPM
+
+        # 填充 HLS 参数 (后4个)
+        self.KP_VEC[HLS_IDX]      = HLS_KP
+        self.KD_VEC[HLS_IDX]      = HLS_KD
+        self.KFF_VEC[HLS_IDX]     = HLS_K_FF
+        self.RATIO_VEC[HLS_IDX]   = HLS_MM_SEC_TO_RPM
+        self.MAX_RPM_VEC[HLS_IDX] = HLS_MAX_RPM
+
+    def _init_visualization(self):
+        plt.ion()
+        plt.rcParams.update({'font.family': 'serif', 'font.size': 10, 'axes.grid': True, 'grid.alpha': 0.3})
+        
+        self.fig = plt.figure(figsize=(7, 5))
+        self.ax_traj = self.fig.add_axes([0.1, 0.1, 0.65, 0.8]) 
+        self.ax_bar  = self.fig.add_axes([0.82, 0.1, 0.05, 0.8])
+        
+        # 背景 (Module 1)
+        bx = np.linspace(LIMIT_MIN, LIMIT_MAX, 300)
+        b_mn, b_mx = get_dynamic_bounds(bx)
+        self.ax_traj.fill_between(bx, b_mn, b_mx, color='#F5F5F5', label='Feasible')
+        self.ax_traj.plot(bx, b_mn, 'k-', lw=1.0); self.ax_traj.plot(bx, b_mx, 'k-', lw=1.0)
+        
+        # 目标轨迹 (仅 ID 1 & 2)
+        self.ax_traj.plot(self.traj_data[:, 0], self.traj_data[:, 1], 'k-', lw=0.5, alpha=0.1)
+        
+        self.target_marker, = self.ax_traj.plot([], [], 'ro', markersize=6, label='Target (Mod 1)', zorder=10)
+        self.trail_scatter = self.ax_traj.scatter([], [], s=3, c='b', alpha=0.6, label='Real Trace', edgecolors='none')
+
+        self.ax_traj.set_xlim(LIMIT_MIN, LIMIT_MAX)
+        self.ax_traj.set_ylim(LIMIT_MIN, LIMIT_MAX)
+        self.ax_traj.set_aspect('equal')
+        self.ax_traj.set_title(f'Hybrid Control: STS(1-6) + HLS(7-10)')
+        
+        self.ax_bar.set_xlim(0, 1); self.ax_bar.set_ylim(0, 100)
+        self.ax_bar.set_xticks([]); self.ax_bar.yaxis.tick_right()
+        self.ax_bar.set_ylabel('Progress (%)')
+        self.ax_bar.yaxis.set_label_position("right")
+        self.bar_fill = patches.Rectangle((0, 0), 1, 0, color='#6a0dad', alpha=0.8)
+        self.ax_bar.add_patch(self.bar_fill)
+        self.fig.canvas.draw(); self.fig.canvas.flush_events()
+
+    def update_visualization(self, target_q1, target_q2, progress_pct):
+        self.target_marker.set_data([target_q1], [target_q2])
+        if len(self.mod1_q1_history) > 0:
+            q1_vis = self.mod1_q1_history[::RENDER_DOWNSAMPLE]
+            q2_vis = self.mod1_q2_history[::RENDER_DOWNSAMPLE]
+            offsets = np.column_stack((q1_vis, q2_vis))
+            self.trail_scatter.set_offsets(offsets)
+        self.bar_fill.set_height(progress_pct)
+        self.fig.canvas.flush_events()
+
+    def _init_data_resource(self):
+        try:
+            package_share_dir = get_package_share_directory('robot_control')
+            data_path = os.path.join(package_share_dir, 'data', 'motor_babbling_10d.npy')
+            if not os.path.exists(data_path):
+                self.get_logger().error(f"❌ File not found: {data_path}")
+                return False
+            
+            raw_data = np.load(data_path)
+            # 展平: (N, 5, 2) -> (N, 10)
+            self.traj_data = raw_data.reshape(raw_data.shape[0], -1)
+            self.total_points = self.traj_data.shape[0]
+            return True
+        except Exception as e:
+            self.get_logger().error(f"❌ Critical Error: {e}")
+            return False
+
+    def state_callback(self, msg):
+        self.last_feedback_time = self.get_clock().now().nanoseconds / 1e9
+        for i, uid in enumerate(msg.ids):
+            self.current_pos_map[uid] = msg.positions[i]
+
+    def emergency_stop(self):
+        self.get_logger().warn("🛑 Emergency Stop!")
+        msg = MotorCommand()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = "base_link"
+        msg.ids = ALL_IDS
+        msg.target_rpms = [0.0] * TOTAL_JOINTS
+        self.pub_cmd.publish(msg)
+        plt.close(self.fig)
+
+    def get_trajectory_point(self, t):
+        idx_float = t * POINTS_PER_SEC
+        idx_curr = int(idx_float)
+        idx_next = idx_curr + 1
+        
+        if idx_next >= self.total_points:
+            return None, None, 100.0
+            
+        alpha = idx_float - idx_curr
+        p_curr = self.traj_data[idx_curr]
+        p_next = self.traj_data[idx_next]
+        
+        pos_ref = p_curr * (1 - alpha) + p_next * alpha
+        vel_ff = (p_next - p_curr) * POINTS_PER_SEC
+        
+        progress = (idx_float / self.total_points) * 100.0
+        return pos_ref, vel_ff, progress
+
+    def control_loop(self):
+        now = self.get_clock().now().nanoseconds / 1e9
+        
+        if now - self.last_feedback_time > 0.2:
+            return 
+        
+        if not all(uid in self.current_pos_map for uid in ALL_IDS):
+            return
+
+        self.is_ready = True
+        self.loop_counter += 1
+
+        # 1. 获取所有 10 个轴的位置
+        curr_pos = np.array([self.current_pos_map[uid] for uid in ALL_IDS])
+
+        # 历史记录 (仅 Mod 1)
+        self.mod1_q1_history.append(curr_pos[0])
+        self.mod1_q2_history.append(curr_pos[1])
+
+        if self.is_finished:
+            self.send_motor_cmd(ALL_IDS, [0.0]*TOTAL_JOINTS)
+            if self.loop_counter % VIS_UPDATE_INTERVAL == 0:
+                self.update_visualization(curr_pos[0], curr_pos[1], 100.0)
+            return
+
+        if not self.is_homed:
+            self.perform_homing(curr_pos)
+            return
+
+        # 2. 轨迹计算
+        t_elapsed = now - self.start_time
+        pos_ref, vel_ff, progress = self.get_trajectory_point(t_elapsed)
+
+        if pos_ref is None:
+            self.is_finished = True
+            return
+
+        # 3. 向量化 PID 控制 (核心修改)
+        # 这里的 KP_VEC, KD_VEC 等已经包含了 STS 和 HLS 的不同参数
+        
+        err = pos_ref - curr_pos
+        d_err = (err - self.prev_err) / DT
+        
+        # RPM = (FF + P + D) * RATIO
+        # RATIO_VEC 自动处理 STS(1.2) 和 HLS(可能不同) 的换算
+        rpm = (vel_ff * self.KFF_VEC + err * self.KP_VEC + d_err * self.KD_VEC) * self.RATIO_VEC
+        
+        self.prev_err = err
+
+        # 向量化限幅 (STS 限 70, HLS 限 100)
+        # np.clip 不支持向量边界，使用 np.minimum/maximum
+        rpm = np.maximum(rpm, -self.MAX_RPM_VEC)
+        rpm = np.minimum(rpm,  self.MAX_RPM_VEC)
+
+        self.send_motor_cmd(ALL_IDS, rpm.tolist())
+        
+        if self.loop_counter % VIS_UPDATE_INTERVAL == 0:
+            self.update_visualization(pos_ref[0], pos_ref[1], progress)
+
+    def perform_homing(self, curr_pos):
+        target_pos = self.traj_data[0]
+        err = target_pos - curr_pos
+        
+        # 归位 P 控制 (Homing 通常不需要太激进，统一处理即可，或者也用 KP_VEC)
+        rpm = np.clip(err * 2.0, -20.0, 20.0)
+        
+        if np.all(np.abs(err) < 5.0):
+            self.is_homed = True
+            self.start_time = self.get_clock().now().nanoseconds / 1e9
+            self.prev_err = np.zeros(TOTAL_JOINTS)
+            self.get_logger().info("✅ All 10 Modules Homed.")
+            self.send_motor_cmd(ALL_IDS, [0.0]*TOTAL_JOINTS)
+        else:
+            self.send_motor_cmd(ALL_IDS, rpm.tolist())
+        
+        if self.loop_counter % VIS_UPDATE_INTERVAL == 0:
+            self.update_visualization(target_pos[0], target_pos[1], 0.0)
+
+    def send_motor_cmd(self, ids, rpms):
+        msg = MotorCommand()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = "base_link"
+        msg.ids = [int(i) for i in ids]
+        msg.target_rpms = [float(r) for r in rpms]
+        self.pub_cmd.publish(msg)
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = StatSculptPlayer()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    except Exception as e:
+        node.get_logger().error(f"Error: {e}")
+    finally:
+        node.emergency_stop()
+        time.sleep(0.1) 
+        node.destroy_node()
+        rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()

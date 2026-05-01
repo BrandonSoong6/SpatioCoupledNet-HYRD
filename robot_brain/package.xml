@@ -1,0 +1,29 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>robot_brain</name>
+  <version>0.0.1</version>
+  <description>The Lifelong Learning Brain for HYRD Robot</description>
+  <maintainer email="brandon@nus.edu.sg">Brandon</maintainer>
+  <license>MIT</license>
+
+  <depend>rclpy</depend>
+  <depend>robot_interfaces</depend>
+  <depend>robot_control</depend>
+
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-scipy</exec_depend>
+  <exec_depend>python3-torch</exec_depend>
+  <exec_depend>python3-numba</exec_depend>
+  <exec_depend>python3-tqdm</exec_depend>
+  <exec_depend>python3-colorama</exec_depend>
+
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

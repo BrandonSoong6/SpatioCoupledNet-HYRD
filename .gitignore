@@ -1,0 +1,30 @@
+# IDE settings
+.vscode/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Build / install artifacts
+build/
+install/
+*.egg-info
+
+# Experiment data and generated outputs
+experiment_data/
+prediction_diagnostic_v9/
+prediction_plots_delta_v8/
+prediction_plots_final_v10/
+prediction_results_v8_fixed/
+*.mp4
+*.zip
+
+# Large binary arrays and temporary numeric outputs
+*.npz
+
+# Root-level generated figures and plots
+/*.png
+
+# Numba cache
+*.nbc
