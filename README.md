@@ -264,7 +264,6 @@ ros2 run robot_brain hybrid_sim
 
 ## Contact
 宋玉立 (Song Yuli), NUS student and SMART visiting student  
-brandon@nus.edu.sg  
 yuli.song@nus.edu.sg  
 This project was developed during a SMART visiting student period and retains 100% author copyright.
 
@@ -605,6 +604,5 @@ ros2 run robot_brain hybrid_sim
 ## 📞 联系
 
 宋玉立 (Song Yuli)，NUS 学生，SMART 访问学生  
-brandon@nus.edu.sg  
 yuli.song@nus.edu.sg  
 本项目为作者在 SMART 访问学生期间开发，保留 100% 版权与使用权。
